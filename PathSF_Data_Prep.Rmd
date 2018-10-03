@@ -1,0 +1,120 @@
+---
+title: "Path Selection Function Data Prep"
+author: "Kathy Zeller"
+date: "October 2, 2018"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### The Path Selection Function (PathSF) approach employed here is presented in [Zeller et al. 2016](https://www.researchgate.net/publication/283492008_Using_step_and_path_selection_functions_for_estimating_resistance_to_movement_pumas_as_a_case_study), Using step and path selection functions for estimating resistance to movement: pumas as a case study. In contrast to traditional Step and Path Selection Functions, this approach allows the examination of different scales of selection for explanatory variables. Following a resource selection framework, the 'used' data is the explanatory variables under each telemetry path. The 'available' data is summarized by a kernel around each path. This kernel can be estimated from the distribution of movement steps in the data or some other biologically relevant kernel. This example uses a Gaussian kernel. By adjusting the bandwidth of the kernel, different extents of available can be examined, which correspond to different scales of selection. 
+
+### This code provides an example of how to prepare the data to run a Path Selection Function with this approach. This code does not provide information on running the conditional logistic regression models. There may be another rmarkdown file providing this information in the future. 
+
+### Read in telemetry data. Example csv is from one individual. 
+```{r eval=FALSE}
+require(RCurl)
+telem<-read.csv(text=getURL("https://raw.githubusercontent.com/kazeller/PathSF-Data-Prep/master/Lion_62.csv"),  header=T)
+```
+
+### Read in environmental variable raster data. Example rasters are elevation and roads. For categorial rasters such as roads, or land cover, this aproach requires the generation of binary surfaces for each category. Here the roads is a binary 0,1 surface. 
+#### Note this uses the path for your working directory, change if needed
+```{r eval=FALSE}
+require(raster)
+download.file("https://github.com/kazeller/PathSF-Data-Prep/raw/master/raster_data.zip", destfile = "raster_data.zip")
+unzip("raster_data.zip")
+elev<-raster("elevation.tif")
+roads<-raster("Roads.tif")
+rasts<-stack(elev, roads)
+out.names<-c("elev","roads")
+names(rasts)<-out.names
+#create directory for saving smoothed rasters
+subDir<-"smoothed_layers"
+dir.create(file.path(getwd(), subDir), showWarnings = FALSE)
+```
+
+### Smooth environmental variables at different scales
+#### Example is applying a Gaussian smooth with 5 different standard deviations, or scales. By smoothing each surface and then sampling each smoothed surface on the paths (below), a kernel smoothed area of available is obtained.
+```{r eval=FALSE}
+require(smoothie)
+scales<-c(90, 180, 360, 720, 1440) # define your scales (these are in meters)
+for (i in 1:length(rasts)){ #loop through rasters in raster stack
+  r<-rasts[[i]]
+  cellsize<-res(rasts[[i]])[1]
+  zmat <- as.matrix(r)
+  for(j in 1:length(scales)){#loop through scales
+    f <- kernel2dsmooth(zmat,kernel.type="gauss", nx=nrow(r), ny=ncol(r),
+                      sigma=scales[j]/cellsize, cellsize=cellsize) # apply the smooth for a scale
+  rast.smooth <- r
+  values(rast.smooth) <- f
+  writeRaster(rast.smooth,paste0("smoothed_layers/",out.names[i],"_", scales[j], "_m.tif"),format="GTiff",overwrite=TRUE) #write it out
+  }
+}
+
+```
+
+
+### Identify daily paths from the telemetry data
+#### Note, the paths can be any temporal subset of the data you wish. We used daily paths in our analysis. 
+```{r eval=FALSE}
+# format dates
+telem$Date<-as.Date(telem$GMT_Date,format="%m/%d/%Y")
+telem$each.Day<-cut(telem$Date,breaks="day",labels=F)
+
+# create daily paths (Spatial Lines objects) and store in a list
+allpaths<-vector("list",length=length(unique(telem$each.Day)))
+days<-unique(telem$each.Day)
+
+for(i in 1:length(allpaths)){
+  tmp<-telem[which(telem$each.Day==days[i]),] #grab a single day
+  line<-as.matrix(cbind(tmp$LongitudeU,tmp$LatitudeUT)) #grab xy data
+  templine<-Line(line)
+  templines<-Lines(list(templine),ID=tmp$Lion[1])
+  templines<-list(templines)
+  templines<-SpatialLines(templines)
+  allpaths[[i]]<-templines
+}
+
+```
+ 
+
+### Set smoothed raster directory and create data frame for storing variable values along paths
+```{r eval=FALSE}
+rast.dir<-paste0(getwd(),"/smoothed_layers/")
+file.list<-list.files(rast.dir)
+used<-paste0(out.names,"_used") # create column names for used data
+avail<-gsub(".tif","",file.list) # create column names for available data
+nms<-c(used,avail) #combine to create all column names
+day_path<-as.data.frame(matrix(NA, ncol=length(nms), nrow=length(unique(telem$each.Day))))
+colnames(day_path)<-nms
+```
+
+### Sample 'used' and 'available' (smoothed) rasters
+```{r eval=FALSE}
+# extract used data along each path 
+for (i in 1:length(rasts)){
+  rast.used<-rasts[[i]]
+   for (j in 1:length(allpaths)){# for daily path
+      day_path[j,i]<-extract(rast.used, allpaths[[j]], method="simple", buffer=30,fun=mean, na.rm=T) #extract values under 30m buffer along each path and take the mean (because the categorial roads surface was binary, this will result in a proportion for that variable)
+    }
+}
+
+# extract available data along each path at the different scales
+for(i in 1:(length(file.list))){ # for each predictor variable
+  rast.avail<-raster(paste0(rast.dir,file.list[i])) # grab raster
+  for (j in 1:length(allpaths)){# for each cat
+      day_path[j,2+i]<-extract(rast.avail, allpaths[[j]], method="simple", fun=mean, na.rm=T) #extract values under each path and take the mean
+    }
+  }
+```
+
+### Write out data frame 
+```{r eval=FALSE}
+write.csv(day_path, "used_and_avail_for_each_daily_path.csv")
+```
+
+### These data can be used to (1) run univariate conditional logistic regression models for each variable at each scale and identify the scale with the lowest AICc value, (2) run multiple conditional logistic regression models with the variables at their best-performing scale. 
